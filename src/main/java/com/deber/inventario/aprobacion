@@ -1,67 +1,55 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
-  <modelVersion>4.0.0</modelVersion>
+package com.deber.inventario.aprobacion;
 
-  <parent>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-parent</artifactId>
-    <version>3.3.4</version>
-    <relativePath/>
-  </parent>
+import com.deber.inventario.auditoria.AuditoriaService;
+import com.deber.inventario.integracion.EventoAprobada;
+import com.deber.inventario.integracion.OutboxService;
+import com.deber.inventario.recomendaciones.Recomendacion;
+import com.deber.inventario.recomendaciones.RecomendacionRepository;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.UncheckedIOException;
+import java.util.NoSuchElementException;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
-  <groupId>com.deber</groupId>
-  <artifactId>inventario-quiebre</artifactId>
-  <version>1.0.0</version>
+@Service
+public class AprobacionService {
 
-  <properties>
-    <java.version>21</java.version>
-  </properties>
+    private final RecomendacionRepository repo;
+    private final AuditoriaService auditoria;
+    private final OutboxService outbox;
+    private final ObjectMapper mapper;
 
-  <dependencies>
-    <dependency>
-      <groupId>org.springframework.boot</groupId>
-      <artifactId>spring-boot-starter-web</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>org.springframework.boot</groupId>
-      <artifactId>spring-boot-starter-jdbc</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>org.springframework.boot</groupId>
-      <artifactId>spring-boot-starter-amqp</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>org.springframework.boot</groupId>
-      <artifactId>spring-boot-starter-actuator</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>org.flywaydb</groupId>
-      <artifactId>flyway-core</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>org.flywaydb</groupId>
-      <artifactId>flyway-database-postgresql</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>org.postgresql</groupId>
-      <artifactId>postgresql</artifactId>
-      <scope>runtime</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.springframework.boot</groupId>
-      <artifactId>spring-boot-starter-test</artifactId>
-      <scope>test</scope>
-    </dependency>
-  </dependencies>
+    public AprobacionService(RecomendacionRepository repo, AuditoriaService auditoria,
+                             OutboxService outbox, ObjectMapper mapper) {
+        this.repo = repo;
+        this.auditoria = auditoria;
+        this.outbox = outbox;
+        this.mapper = mapper;
+    }
 
-  <build>
-    <plugins>
-      <plugin>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-maven-plugin</artifactId>
-      </plugin>
-    </plugins>
-  </build>
-</project>
+    /**
+     * En una sola transacción: cambia el estado, deja la auditoría y (si se aprueba) encola el evento.
+     */
+    @Transactional
+    public void decidir(long id, boolean aprobar, String usuario) {
+        String nuevoEstado = aprobar ? "APROBADA" : "RECHAZADA";
+        int filas = repo.cambiarEstadoSiPendiente(id, nuevoEstado, usuario);
+        if (filas == 0) {
+            repo.buscar(id).orElseThrow(() -> new NoSuchElementException("La recomendación " + id + " no existe"));
+            throw new IllegalStateException("La recomendación " + id + " ya fue decidida");
+        }
+        auditoria.registrar("RECOMENDACION", id, nuevoEstado, usuario, "");
+
+        if (aprobar) {
+            Recomendacion r = repo.buscar(id).orElseThrow();
+            EventoAprobada evento = new EventoAprobada(r.id(), r.tipo(), r.productoId(),
+                    r.bodegaDestinoId(), r.bodegaOrigenId(), r.cantidad(), usuario);
+            try {
+                outbox.encolar("RecomendacionAprobada", mapper.writeValueAsString(evento));
+            } catch (JsonProcessingException e) {
+                throw new UncheckedIOException(e);
+            }
+        }
+    }
+}
